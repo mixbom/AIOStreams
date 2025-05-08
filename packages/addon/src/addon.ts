@@ -37,8 +37,15 @@ import {
   Settings,
   createLogger,
   generateMediaFlowStreams,
+  getStremThruConfig,
+  getStremThruPublicIp,
+  generateStremThruStreams,
+  safeRegexTest,
+  compileRegex,
+  formRegexFromKeywords,
 } from '@aiostreams/utils';
 import { errorStream } from './responses';
+import { isMatch } from 'super-regex';
 
 const logger = createLogger('addon');
 
@@ -49,6 +56,23 @@ export class AIOStreams {
     this.config = config;
   }
 
+  private async retryGetIp<T>(
+    getter: () => Promise<T | null>,
+    label: string,
+    maxRetries: number = 3
+  ): Promise<T> {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      const result = await getter();
+      if (result) {
+        return result;
+      }
+      logger.warn(
+        `Failed to get ${label}, retrying... (${attempt}/${maxRetries})`
+      );
+    }
+    throw new Error(`Failed to get ${label} after ${maxRetries} attempts`);
+  }
+
   private async getRequestingIp() {
     let userIp = this.config.requestingIp;
     const PRIVATE_IP_REGEX =
@@ -57,23 +81,18 @@ export class AIOStreams {
     if (userIp && PRIVATE_IP_REGEX.test(userIp)) {
       userIp = undefined;
     }
-    const mediaFlowConfig = getMediaFlowConfig(this.config);
-    if (mediaFlowConfig.mediaFlowEnabled) {
-      let mediaFlowIp: string | null = null;
-      // if mediaflow is enabled, we MUST use its IP and throw an error if we can't get it
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        mediaFlowIp = await getMediaFlowPublicIp(
-          mediaFlowConfig,
-          this.config.instanceCache
-        );
-        if (mediaFlowIp) break;
-      }
-      if (!mediaFlowIp) {
-        throw new Error('Failed to get MediaFlow IP after 3 attempts');
-      }
-      if (mediaFlowIp) {
-        userIp = mediaFlowIp;
-      }
+    const mediaflowConfig = getMediaFlowConfig(this.config);
+    const stremThruConfig = getStremThruConfig(this.config);
+    if (mediaflowConfig.mediaFlowEnabled) {
+      userIp = await this.retryGetIp(
+        () => getMediaFlowPublicIp(mediaflowConfig),
+        'MediaFlow public IP'
+      );
+    } else if (stremThruConfig.stremThruEnabled) {
+      userIp = await this.retryGetIp(
+        () => getStremThruPublicIp(stremThruConfig),
+        'StremThru public IP'
+      );
     }
     return userIp;
   }
@@ -86,15 +105,13 @@ export class AIOStreams {
       this.config.requestingIp = await this.getRequestingIp();
     } catch (error) {
       logger.error(error);
-      return [errorStream(`Failed to get MediaFlow IP`)];
+      return [errorStream(`Failed to get Proxy IP`)];
     }
 
     const { parsedStreams, errorStreams } =
       await this.getParsedStreams(streamRequest);
 
     const skipReasons = {
-      excludeKeywords: 0,
-      requiredKeywords: 0,
       excludeLanguages: 0,
       excludeResolutions: 0,
       excludeQualities: 0,
@@ -102,42 +119,85 @@ export class AIOStreams {
       excludeAudioTags: 0,
       excludeVisualTags: 0,
       excludeStreamTypes: 0,
-      excludeCached: 0,
+      excludeUncached: 0,
       sizeFilters: 0,
       duplicateStreams: 0,
       streamLimiters: 0,
+      excludeRegex: 0,
+      requiredRegex: 0,
     };
 
     logger.info(
       `Got ${parsedStreams.length} parsed streams and ${errorStreams.length} error streams in ${getTimeTakenSincePoint(startTime)}`
     );
-    const filterStartTime = new Date().getTime();
 
-    const excludeRegex = this.config.excludeFilters
-      ? new RegExp(
-          `(?<![^ [(_\\-.])(${this.config.excludeFilters
-            .map((filter) => filter.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'))
-            .map((filter) => filter.replace(/\s/g, '[ .\\-_]?'))
-            .join('|')})(?=[ \\)\\]_.-]|$)`,
-          'i'
-        )
-      : null;
+    const excludeRegexPattern = this.config.apiKey
+      ? this.config.regexFilters?.excludePattern ||
+        Settings.DEFAULT_REGEX_EXCLUDE_PATTERN
+      : undefined;
+    const excludeRegex = excludeRegexPattern
+      ? compileRegex(excludeRegexPattern, 'i')
+      : undefined;
 
-    const strictIncludeRegex = this.config.strictIncludeFilters
-      ? new RegExp(
-          `(?<![^ [(_\\-.])(${this.config.strictIncludeFilters
-            .map((filter) => filter.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'))
-            .map((filter) => filter.replace(/\s/g, '[ .\\-_]?'))
-            .join('|')})(?=[ \\)\\]_.-]|$)`,
-          'i'
-        )
-      : null;
+    const excludeKeywordsRegex = this.config.excludeFilters
+      ? formRegexFromKeywords(this.config.excludeFilters)
+      : undefined;
 
-    excludeRegex || strictIncludeRegex
+    const requiredRegexPattern = this.config.apiKey
+      ? this.config.regexFilters?.includePattern ||
+        Settings.DEFAULT_REGEX_INCLUDE_PATTERN
+      : undefined;
+    const requiredRegex = requiredRegexPattern
+      ? compileRegex(requiredRegexPattern, 'i')
+      : undefined;
+
+    const requiredKeywordsRegex = this.config.strictIncludeFilters
+      ? formRegexFromKeywords(this.config.strictIncludeFilters)
+      : undefined;
+
+    const sortRegexPatterns = this.config.apiKey
+      ? this.config.regexSortPatterns || Settings.DEFAULT_REGEX_SORT_PATTERNS
+      : undefined;
+
+    const sortRegexes: { name?: string; regex: RegExp }[] | undefined =
+      sortRegexPatterns
+        ? sortRegexPatterns
+            .split(/\s+/)
+            .filter(Boolean)
+            .map((pattern) => {
+              const delimiter = '<::>';
+              const delimiterIndex = pattern.indexOf(delimiter);
+              if (delimiterIndex !== -1) {
+                const name = pattern
+                  .slice(0, delimiterIndex)
+                  .replace(/_/g, ' ');
+                const regexPattern = pattern.slice(
+                  delimiterIndex + delimiter.length
+                );
+
+                const regex = compileRegex(regexPattern, 'i');
+                return { name, regex };
+              }
+              return { regex: compileRegex(pattern, 'i') };
+            })
+        : undefined;
+
+    excludeRegex ||
+    excludeKeywordsRegex ||
+    requiredRegex ||
+    requiredKeywordsRegex ||
+    sortRegexes
       ? logger.debug(
-          `Using keyword regex filters: excludeRegex: ${excludeRegex}, strictIncludeRegex: ${strictIncludeRegex}`
+          `The following regex patterns are being used:\n` +
+            `Exclude Regex: ${excludeRegex}\n` +
+            `Exclude Keywords: ${excludeKeywordsRegex}\n` +
+            `Required Regex: ${requiredRegex}\n` +
+            `Required Keywords: ${requiredKeywordsRegex}\n` +
+            `Sort Regexes: ${sortRegexes?.map((regex) => `${regex.name || 'Unnamed'}: ${regex.regex}`).join(' --> ')}\n`
         )
-      : null;
+      : [];
+
+    const filterStartTime = new Date().getTime();
 
     let filteredResults = parsedStreams.filter((parsedStream) => {
       const streamTypeFilter = this.config.streamTypes?.find(
@@ -250,7 +310,7 @@ export class AIOStreams {
         parsedStream.provider &&
         !parsedStream.provider.cached
       ) {
-        skipReasons.excludeCached++;
+        skipReasons.excludeUncached++;
         return false;
       }
 
@@ -312,35 +372,45 @@ export class AIOStreams {
         return false;
       }
 
-      // apply keyword filters
-      if (
-        this.config.excludeFilters &&
-        this.config.excludeFilters.length > 0 &&
-        excludeRegex
-      ) {
-        if (parsedStream.filename && excludeRegex.test(parsedStream.filename)) {
-          skipReasons.excludeKeywords++;
-          return false;
+      // generate array of excludeTests. for each regex, only add to array if the filename or indexers are defined
+      let excludeTests: (boolean | null)[] = [];
+      let requiredTests: (boolean | null)[] = [];
+
+      const addToTests = (field: string | undefined) => {
+        if (field) {
+          excludeTests.push(
+            excludeRegex ? safeRegexTest(excludeRegex, field) : null,
+            excludeKeywordsRegex
+              ? safeRegexTest(excludeKeywordsRegex, field)
+              : null
+          );
+          requiredTests.push(
+            requiredRegex ? safeRegexTest(requiredRegex, field) : null,
+            requiredKeywordsRegex
+              ? safeRegexTest(requiredKeywordsRegex, field)
+              : null
+          );
         }
-        if (parsedStream.indexers && excludeRegex.test(parsedStream.indexers)) {
-          skipReasons.excludeKeywords++;
-          return false;
-        }
+      };
+
+      addToTests(parsedStream.filename);
+      addToTests(parsedStream.folderName);
+      addToTests(parsedStream.indexers);
+
+      // filter out any null values as these are when the regex is not defined
+      excludeTests = excludeTests.filter((test) => test !== null);
+      requiredTests = requiredTests.filter((test) => test !== null);
+
+      if (excludeTests.length > 0 && excludeTests.some((test) => test)) {
+        skipReasons.excludeRegex++;
+        return false;
       }
 
-      if (
-        this.config.strictIncludeFilters &&
-        this.config.strictIncludeFilters.length > 0 &&
-        strictIncludeRegex
-      ) {
-        if (
-          parsedStream.filename &&
-          !strictIncludeRegex.test(parsedStream.filename)
-        ) {
-          skipReasons.requiredKeywords++;
-          return false;
-        }
+      if (requiredTests.length > 0 && !requiredTests.some((test) => test)) {
+        skipReasons.requiredRegex++;
+        return false;
       }
+
       return true;
     });
 
@@ -439,6 +509,32 @@ export class AIOStreams {
         filteredResults.length - cleanedStreams.length;
       filteredResults = cleanedStreams;
     }
+    // pre compute highest indexes for regexSortPatterns
+    const startPrecomputeTime = new Date().getTime();
+    filteredResults.forEach((stream: ParsedStream) => {
+      if (sortRegexes) {
+        for (let i = 0; i < sortRegexes.length; i++) {
+          if (!stream.filename && !stream.folderName) continue;
+          const regex = sortRegexes[i];
+          if (
+            (stream.filename && isMatch(regex.regex, stream.filename)) ||
+            (stream.folderName && isMatch(regex.regex, stream.folderName))
+          ) {
+            stream.regexMatched = {
+              name: regex.name,
+              pattern: regex.regex.source,
+              index: i,
+            };
+            break;
+          }
+        }
+      }
+    });
+    logger.info(
+      `Precomputed sortRegex indexes for ${filteredResults.length} streams in ${getTimeTakenSincePoint(
+        startPrecomputeTime
+      )}`
+    );
     // Apply sorting
     const sortStartTime = new Date().getTime();
     // initially sort by filename to ensure consistent results
@@ -531,35 +627,39 @@ export class AIOStreams {
     return streams;
   }
 
-  private shouldProxyStream(stream: ParsedStream): boolean {
-    const mediaFlowConfig = getMediaFlowConfig(this.config);
-    if (!mediaFlowConfig.mediaFlowEnabled) return false;
+  private shouldProxyStream(
+    stream: ParsedStream,
+    mediaFlowConfig: ReturnType<typeof getMediaFlowConfig>,
+    stremThruConfig: ReturnType<typeof getStremThruConfig>
+  ): boolean {
     if (!stream.url) return false;
+
+    const streamProvider = stream.provider ? stream.provider.id : 'none';
+
     // // now check if mediaFlowConfig.proxiedAddons or mediaFlowConfig.proxiedServices is not null
     // logger.info(this.config.mediaFlowConfig?.proxiedAddons);
     // logger.info(stream.addon.id);
     if (
-      mediaFlowConfig.proxiedAddons &&
-      mediaFlowConfig.proxiedAddons.length > 0 &&
-      !mediaFlowConfig.proxiedAddons.includes(stream.addon.id)
+      mediaFlowConfig.mediaFlowEnabled &&
+      (!mediaFlowConfig.proxiedAddons?.length ||
+        mediaFlowConfig.proxiedAddons.includes(stream.addon.id)) &&
+      (!mediaFlowConfig.proxiedServices?.length ||
+        mediaFlowConfig.proxiedServices.includes(streamProvider))
     ) {
-      return false;
+      return true;
     }
 
     if (
-      (mediaFlowConfig.proxiedServices &&
-        mediaFlowConfig.proxiedServices.length > 0 &&
-        stream.provider &&
-        !mediaFlowConfig.proxiedServices.includes(stream.provider.id)) ||
-      (mediaFlowConfig.proxiedServices &&
-        mediaFlowConfig.proxiedServices.length > 0 &&
-        !stream.provider &&
-        !mediaFlowConfig.proxiedServices.includes('none'))
+      stremThruConfig.stremThruEnabled &&
+      (!stremThruConfig.proxiedAddons?.length ||
+        stremThruConfig.proxiedAddons.includes(stream.addon.id)) &&
+      (!stremThruConfig.proxiedServices?.length ||
+        stremThruConfig.proxiedServices.includes(streamProvider))
     ) {
-      return false;
+      return true;
     }
 
-    return true;
+    return false;
   }
 
   private getFormattedText(parsedStream: ParsedStream): {
@@ -609,20 +709,38 @@ export class AIOStreams {
   private async createStreamObjects(
     parsedStreams: ParsedStream[]
   ): Promise<Stream[]> {
+    const mediaFlowConfig = getMediaFlowConfig(this.config);
+    const stremThruConfig = getStremThruConfig(this.config);
+
     // Identify streams that require proxying
     const streamsToProxy = parsedStreams
       .map((stream, index) => ({ stream, index }))
-      .filter(({ stream }) => stream.url && this.shouldProxyStream(stream));
+      .filter(
+        ({ stream }) =>
+          stream.url &&
+          this.shouldProxyStream(stream, mediaFlowConfig, stremThruConfig)
+      );
 
     const proxiedUrls = streamsToProxy.length
-      ? await generateMediaFlowStreams(
-          getMediaFlowConfig(this.config),
-          streamsToProxy.map(({ stream }) => ({
-            url: stream.url!,
-            filename: stream.filename,
-            headers: stream.stream?.behaviorHints?.proxyHeaders,
-          }))
-        )
+      ? mediaFlowConfig.mediaFlowEnabled
+        ? await generateMediaFlowStreams(
+            mediaFlowConfig,
+            streamsToProxy.map(({ stream }) => ({
+              url: stream.url!,
+              filename: stream.filename,
+              headers: stream.stream?.behaviorHints?.proxyHeaders,
+            }))
+          )
+        : stremThruConfig.stremThruEnabled
+          ? await generateStremThruStreams(
+              stremThruConfig,
+              streamsToProxy.map(({ stream }) => ({
+                url: stream.url!,
+                filename: stream.filename,
+                headers: stream.stream?.behaviorHints?.proxyHeaders,
+              }))
+            )
+          : null
       : null;
 
     const removeIndexes = new Set<number>();
@@ -649,6 +767,11 @@ export class AIOStreams {
     }
 
     // Build final Stream objects
+    const proxyBingeGroupPrefix = mediaFlowConfig.mediaFlowEnabled
+      ? 'mfp.'
+      : stremThruConfig.stremThruEnabled
+        ? 'st.'
+        : '';
     const streamObjects: Stream[] = await Promise.all(
       parsedStreams.map((parsedStream) => {
         const { name, description } = this.getFormattedText(parsedStream);
@@ -676,7 +799,7 @@ export class AIOStreams {
               ? Math.floor(parsedStream.size)
               : undefined,
             filename: parsedStream.filename,
-            bingeGroup: `${parsedStream.proxied ? 'mfp.' : ''}${Settings.ADDON_ID}|${parsedStream.addon.name}|${combinedTags.join('|')}`,
+            bingeGroup: `${parsedStream.proxied ? proxyBingeGroupPrefix : ''}${Settings.ADDON_ID}|${parsedStream.addon.name}|${combinedTags.join('|')}`,
             proxyHeaders: parsedStream.stream?.behaviorHints?.proxyHeaders,
             notWebReady: parsedStream.stream?.behaviorHints?.notWebReady,
           },
@@ -712,6 +835,39 @@ export class AIOStreams {
           (resolution) => resolution[b.resolution]
         )
       );
+    } else if (field === 'regexSort') {
+      const regexSortPatterns =
+        this.config.regexSortPatterns || Settings.DEFAULT_REGEX_SORT_PATTERNS;
+      if (!regexSortPatterns) return 0;
+      try {
+        // Get direction once
+        const direction = this.config.sortBy.find(
+          (sort) => Object.keys(sort)[0] === 'regexSort'
+        )?.direction;
+
+        // Early exit if no filename to test
+        if (!a.filename && !b.filename) return 0;
+        if (!a.filename) return direction === 'asc' ? -1 : 1;
+        if (!b.filename) return direction === 'asc' ? 1 : -1;
+
+        const aHighestIndex = a.regexMatched?.index;
+        const bHighestIndex = b.regexMatched?.index;
+
+        // If both have a regex match, sort by the highest index
+        if (aHighestIndex !== undefined && bHighestIndex !== undefined) {
+          return direction === 'asc'
+            ? bHighestIndex - aHighestIndex
+            : aHighestIndex - bHighestIndex;
+        }
+        // If one has a regex match and the other doesn't, sort by the one that does
+        if (aHighestIndex !== undefined) return direction === 'asc' ? 1 : -1;
+        if (bHighestIndex !== undefined) return direction === 'asc' ? -1 : 1;
+
+        // If both have no regex match, they are equal
+        return 0;
+      } catch (e) {
+        return 0;
+      }
     } else if (field === 'cached') {
       let aCanbeCached = a.provider;
       let bCanbeCached = b.provider;
